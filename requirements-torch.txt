@@ -1,0 +1,3 @@
+# Install a CUDA-enabled PyTorch build appropriate for the target machine.
+# See https://pytorch.org/get-started/locally/ for the correct wheel index.
+torch>=2.1
