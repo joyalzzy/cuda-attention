@@ -25,7 +25,17 @@
 # Runtime configuration (export before qsub, pass with qsub -v, or edit here):
 #   PROJECT_DIR                  checkout path; default PBS_O_WORKDIR
 #   VENV_DIR                     reusable venv; default PROJECT_DIR/.venv-aspire
-#   PYTHON_MODULE                optional module name; default empty
+#   PYTHON_MODULE                Aspire module providing PyTorch/Python; default
+#                                pytorch/2.10.0-py3-cu12.6 (supplies torch, numpy,
+#                                triton, and CUDA 12.6; set empty to pip-install)
+#   PYTHON_COMMAND               interpreter used to create venv; default python3
+#   MIN_PYTHON_MAJOR/MIN_PYTHON_MINOR required version; default 3.10
+#
+# The venv is created with --system-site-packages so the module's torch/triton/
+# numpy/CUDA are reused; pip only installs anything the module omits.
+#
+# Example (verify exact module name on your account):
+#   qsub -v PYTHON_MODULE=pytorch/2.10.0-py3-cu12.6,PYTHON_COMMAND=python3,VENV_DIR=$PWD/.venv-aspire-py310 -P <PROJECT_CODE> -q <GPU_QUEUE> run-aspire.sh
 #   CUDA_MODULE                  optional module name; default empty
 #   EXTRA_MODULES                optional space-separated module names
 #   INSTALL_DEPS                 auto (default), always, or never
@@ -73,7 +83,10 @@ trap on_error ERR
 
 : "${PROJECT_DIR:=${PBS_O_WORKDIR:-$PWD}}"
 : "${VENV_DIR:=${PROJECT_DIR}/.venv-aspire}"
-: "${PYTHON_MODULE:=}"
+: "${PYTHON_MODULE:=pytorch/2.10.0-py3-cu12.6}"
+: "${PYTHON_COMMAND:=python3}"
+: "${MIN_PYTHON_MAJOR:=3}"
+: "${MIN_PYTHON_MINOR:=10}"
 : "${CUDA_MODULE:=}"
 : "${EXTRA_MODULES:=}"
 : "${INSTALL_DEPS:=auto}"
@@ -128,14 +141,28 @@ if [[ -n "$PYTHON_MODULE$CUDA_MODULE$EXTRA_MODULES" ]]; then
     fi
 fi
 
-command -v python3 >/dev/null 2>&1 ||
-    fatal "python3 unavailable; set PYTHON_MODULE to an Aspire-provided module"
+command -v "$PYTHON_COMMAND" >/dev/null 2>&1 ||
+    fatal "$PYTHON_COMMAND unavailable; set PYTHON_MODULE/PYTHON_COMMAND to Aspire Python >=${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}"
+
+# Parse the interpreter version without using project code. Python 3.6 and
+# older cannot parse ``from __future__ import annotations``; current
+# PyTorch/Triton generally require an even newer supported Python.
+if ! "$PYTHON_COMMAND" -c \
+    "import sys; raise SystemExit(0 if sys.version_info >= (${MIN_PYTHON_MAJOR}, ${MIN_PYTHON_MINOR}) else 1)"; then
+    detected_python="$($PYTHON_COMMAND --version 2>&1 || true)"
+    fatal "${PYTHON_COMMAND} is too old (${detected_python}); load/configure Python >=${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR} before creating the venv"
+fi
+
 command -v nvidia-smi >/dev/null 2>&1 ||
     fatal "nvidia-smi unavailable; this does not appear to be an NVIDIA GPU node"
 nvidia-smi -L | grep -q '^GPU ' || fatal "No allocated NVIDIA GPU is visible"
 
 # Keep the reusable environment in project/scratch storage. Do not remove or
 # overwrite a non-venv directory.
+#
+# ``--system-site-packages`` lets the venv reuse the Aspire module's PyTorch,
+# NumPy, Triton, and CUDA 12.6 runtime instead of pip-reinstalling torch. Only
+# genuinely missing add-ons are pip-installed into the venv on top of the module.
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
     if [[ -e "$VENV_DIR" ]]; then
         [[ -d "$VENV_DIR" ]] || fatal "VENV_DIR exists but is not a directory: $VENV_DIR"
@@ -144,11 +171,19 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
     else
         mkdir -p "$VENV_DIR"
     fi
-    python3 -m venv "$VENV_DIR"
+    "$PYTHON_COMMAND" -m venv --system-site-packages "$VENV_DIR"
 fi
 
 readonly PYTHON="$VENV_DIR/bin/python"
 [[ -x "$PYTHON" ]] || fatal "Invalid venv: $VENV_DIR"
+
+# A venv keeps the interpreter used at creation time. Loading a newer module
+# does not upgrade an existing old venv, so stop with an explicit remediation.
+if ! "$PYTHON" -c \
+    "import sys; raise SystemExit(0 if sys.version_info >= (${MIN_PYTHON_MAJOR}, ${MIN_PYTHON_MINOR}) else 1)"; then
+    venv_python="$($PYTHON --version 2>&1 || true)"
+    fatal "Existing VENV_DIR uses an unsupported interpreter (${venv_python}). Choose a new VENV_DIR or remove/recreate it with ${PYTHON_COMMAND} >=${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}; this script will not delete it automatically."
+fi
 
 # Persistent caches reduce repeated Triton compilation and downloads. A
 # job-specific Triton cache avoids concurrent-writer corruption.
@@ -175,26 +210,37 @@ if [[ "$INSTALL_DEPS" == always ||
       ( "$INSTALL_DEPS" == auto && "$need_install" == 1 ) ]]; then
     "$PYTHON" -m pip install --upgrade pip setuptools wheel
 
-    pip_args=(install --upgrade "$PYTORCH_INSTALL_SPEC" numpy)
+    # Resolve an offline wheelhouse or an index once, reused for each add-on.
+    source_args=()
     if [[ -n "$WHEELHOUSE" ]]; then
         [[ -d "$WHEELHOUSE" ]] || fatal "WHEELHOUSE does not exist: $WHEELHOUSE"
-        pip_args+=(--no-index --find-links "$WHEELHOUSE")
+        source_args+=(--no-index --find-links "$WHEELHOUSE")
     elif [[ -n "$PYTORCH_INDEX_URL" ]]; then
-        pip_args+=(--index-url "$PYTORCH_INDEX_URL")
+        source_args+=(--index-url "$PYTORCH_INDEX_URL")
     fi
     if [[ -n "$EXTRA_PIP_ARGS" ]]; then
         IFS=' ' read -r -a extra_pip_args <<< "$EXTRA_PIP_ARGS"
-        pip_args+=("${extra_pip_args[@]}")
+        source_args+=("${extra_pip_args[@]}")
     fi
-    "$PYTHON" -m pip "${pip_args[@]}"
 
-    # Most CUDA PyTorch wheels include a compatible Triton. Install it
-    # separately only if the chosen wheel did not provide it.
+    # The pytorch/2.10.0-py3-cu12.6 module supplies torch (and CUDA 12.6). Do
+    # not pip-reinstall torch over it; only addon packages the module omits.
+    installed_torch=0
+    if [[ -n "$PYTHON_MODULE" ]] && "$PYTHON" -c 'import torch' >/dev/null 2>&1; then
+        installed_torch=1
+    fi
+
+    if [[ "$installed_torch" == 0 ]]; then
+        pip_args=(install --upgrade "$PYTORCH_INSTALL_SPEC" numpy "${source_args[@]}")
+        "$PYTHON" -m pip "${pip_args[@]}"
+    elif ! "$PYTHON" -c 'import numpy' >/dev/null 2>&1; then
+        "$PYTHON" -m pip install numpy "${source_args[@]}"
+    fi
+
+    # Most CUDA PyTorch builds bundle a compatible Triton; install one only if
+    # the module/wheel did not provide it.
     if ! "$PYTHON" -c 'import triton' >/dev/null 2>&1; then
-        triton_args=(install --upgrade triton)
-        if [[ -n "$WHEELHOUSE" ]]; then
-            triton_args+=(--no-index --find-links "$WHEELHOUSE")
-        fi
+        triton_args=(install --upgrade triton "${source_args[@]}")
         "$PYTHON" -m pip "${triton_args[@]}"
     fi
 elif [[ "$need_install" == 1 ]]; then
