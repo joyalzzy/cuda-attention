@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 .venv/
 .venv-torch/
+.venv-aspire/
 .tmp-torch/
+.cache/
 artifacts/
 tensorflow_transformer_benchmark_report.md

@@ -33,10 +33,11 @@ _GELU_COEF = 0.7071067811865476  # 1 / sqrt(2)
 
 @triton.jit
 def _fused_ln_gemm1_gelu(
-    X, W1, B1, H1,
+    X, Gamma, Beta, W1, B1, H1,
     eps,
     S, F,
     stride_xb, stride_xs, stride_xd,
+    stride_gd, stride_bd,
     stride_w1f, stride_w1d,
     stride_b1f,
     stride_h1b, stride_h1s, stride_h1f,
@@ -68,8 +69,10 @@ def _fused_ln_gemm1_gelu(
     var = sum_x2 / D - mean * mean
     rstd = tl.rsqrt(tl.maximum(var, 0.0) + eps)
 
-    # Pass 2: GEMM1 (X_norm @ W1^T) + bias + exact GELU -> h1 tile.
-    offs_f = tl.arange(0, BLOCK_F)
+    # Pass 2: affine LayerNorm + GEMM1 + bias + exact GELU -> h1 tile.
+    # Grid dimension 2 indexes the FFN output tile; every F tile is computed.
+    start_f = tl.program_id(2)
+    offs_f = start_f * BLOCK_F + tl.arange(0, BLOCK_F)
     acc = tl.zeros((BLOCK_M, BLOCK_F), tl.float32)
     b1 = tl.load(B1 + offs_f * stride_b1f, mask=offs_f < F, other=0.0).to(tl.float32)
     acc += b1[None, :]
@@ -81,7 +84,18 @@ def _fused_ln_gemm1_gelu(
             mask=row_mask[:, None] & d_mask[None, :],
             other=0.0,
         ).to(tl.float32)
+        gamma = tl.load(
+            Gamma + offs_d * stride_gd,
+            mask=d_mask,
+            other=0.0,
+        ).to(tl.float32)
+        beta = tl.load(
+            Beta + offs_d * stride_bd,
+            mask=d_mask,
+            other=0.0,
+        ).to(tl.float32)
         xn = (x - mean[:, None]) * rstd[:, None]
+        xn = xn * gamma[None, :] + beta[None, :]
         xn = xn.to(X.dtype.element_ty)
         w1 = tl.load(
             W1 + offs_f[:, None] * stride_w1f + offs_d[None, :] * stride_w1d,
@@ -216,11 +230,12 @@ def fused_ffn(
     block_f = 64
 
     # Kernel A: LayerNorm + GEMM1 + GELU -> h1.
-    grid_a = (triton.cdiv(seq_len, block_m), batch)
+    grid_a = (triton.cdiv(seq_len, block_m), batch, triton.cdiv(ffn_dim, block_f))
     _fused_ln_gemm1_gelu[grid_a](
-        x, w1, b1, h1,
+        x, gamma, beta, w1, b1, h1,
         float(norm.eps), seq_len, ffn_dim,
         x.stride(0), x.stride(1), x.stride(2),
+        gamma.stride(0), beta.stride(0),
         w1.stride(0), w1.stride(1),
         b1.stride(0),
         h1.stride(0), h1.stride(1), h1.stride(2),

@@ -54,8 +54,20 @@ If a benchmark harness itself must be fixed, isolate that change, explain why, a
 | Local GPU/CUDA tools | No `nvidia-smi` or `nvcc` found at last verification |
 | Local CPU correctness | float32/bfloat16 unmasked, causal, padded, and combined cases pass (kernels disabled on CPU by design) |
 | Kernel GPU validation | **pending** — run `tools/test_torch_kernels.py --device cuda` on the target GPU |
+| Aspire 2A runner | `run-aspire.sh`: PBS GPU job for kernel gates, CUDA matrix, benchmarks, profiles, and timestamped artifacts; written but never executed locally |
 
 Environment facts can become stale. Re-check them before planning installation or benchmarking.
+
+### Aspire 2A execution policy
+
+- `run-aspire.sh` is a **PBS compute-job script**, not an access script. It contains no `ssh`, `scp`, or `rsync` commands.
+- Never execute it on a login node or local workstation; it exits unless `PBS_JOBID` and a readable `PBS_NODEFILE` exist.
+- Follow the [workshop Aspire 2A access guide](https://github.com/ntuhpcai/workshops/tree/main/hpc_ai/build_lulesh#accessing-aspire-2a) to reach Aspire 2A, place the checkout in project/scratch storage, then submit with current site values, for example: `qsub -P <PROJECT_CODE> -q <GPU_QUEUE> run-aspire.sh`.
+- PBS directives do not reliably expand shell variables. Pass account, queue, resource, and walltime overrides through `qsub` or edit the directives before submission.
+- Aspire account codes, queue names, module names, GPU resource syntax, and package-mirror policy are site/account specific; verify them against the current NSCC documentation before submission.
+- The script uses a reusable `.venv-aspire`, supports online or wheelhouse installs, captures environment metadata, fails on correctness errors, and writes logs/profiles below `artifacts/aspire2a/`.
+- Test order is mandatory: conformance → direct Triton kernel gate → compact CUDA matrix → representative benchmarks → optional profiles. Do not report benchmark output if an earlier gate fails.
+- Set `ENABLE_EXPERIMENTAL_FFN=1` only for a separate validation run; the script exports the repository's `TORCH_TRANSFORMER_FFN_KERNEL` variable.
 
 ## 4. Exact reference behavior
 
